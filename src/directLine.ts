@@ -372,7 +372,14 @@ export interface DirectLineOptions {
     timeout?: number,
     // Attached to all requests to identify requesting agent.
     botAgent?: string,
-    conversationStartProperties?: any
+    conversationStartProperties?: any,
+    handleHistoryApi?: boolean,
+    historyId?: string,
+    historyLoaded?: () => void,
+    lifetimeRefreshToken?:number,
+    intervalRefreshToken?:number,
+    retries?:number,
+    retryDelay?:number
 }
 
 export interface Services {
@@ -426,8 +433,7 @@ const makeServices = (services: Partial<Services>): Services => {
     }
 }
 
-const lifetimeRefreshToken = 30 * 60 * 1000;
-const intervalRefreshToken = lifetimeRefreshToken / 2;
+
 
 const POLLING_INTERVAL_LOWER_BOUND: number = 200; //ms
 
@@ -448,12 +454,14 @@ export interface IBotConnection {
     end(): void,
     referenceGrammarId?: string,
     postActivity(activity: Activity): Observable<string>,
-    getSessionId? : () => Observable<string>
+    getSessionId? : () => Observable<string>,
+    historyLoadedFlag: boolean
 }
 
 export class DirectLine implements IBotConnection {
     public connectionStatus$ = new BehaviorSubject(ConnectionStatus.Uninitialized);
     public activity$: Observable<Activity>;
+    public activities$: Observable<Activity[]>;
 
     private domain = "https://directline.botframework.com/v3/directline";
     private webSocket: boolean;
@@ -470,13 +478,27 @@ export class DirectLine implements IBotConnection {
     public referenceGrammarId: string;
     private timeout = 20 * 1000;
     private retries: number;
-
+    public lifetimeRefreshToken = 30 * 60 * 1000;
+    public intervalRefreshToken = this.lifetimeRefreshToken / 2;
+    public retryDelay:number;
     private localeOnStartConversation: string;
     private userIdOnStartConversation: string;
 
     private pollingInterval: number = 1000; //ms
 
     private tokenRefreshSubscription: Subscription;
+
+    private isFirstTime: boolean = true;
+
+    private hasHistory: boolean = false;
+
+    private handleHistoryApi: boolean = false;
+
+    private historyId: string;
+
+    public historyLoadedFlag: boolean = false;
+
+    private historyLoaded: () => void;
 
     constructor(options: DirectLineOptions & Partial<Services>) {
         this.secret = options.secret;
@@ -515,7 +537,27 @@ export class DirectLine implements IBotConnection {
             this.timeout = options.timeout;
         }
 
-        this.retries = (lifetimeRefreshToken - intervalRefreshToken) / this.timeout;
+        if (options.lifetimeRefreshToken !== undefined) {
+            this.lifetimeRefreshToken = options.lifetimeRefreshToken;
+        }
+
+        if (options.intervalRefreshToken !== undefined) {
+            this.intervalRefreshToken = options.intervalRefreshToken;
+        }
+
+        if (options.retries !== undefined) {
+            this.retries = options.retries;
+         }
+         else{
+            this.retries = (this.lifetimeRefreshToken - this.intervalRefreshToken) / this.timeout;
+         }
+
+         if (options.retryDelay !== undefined) {
+            this.retryDelay = options.retryDelay;
+         }
+         else{
+            this.retryDelay = this.timeout;
+         }
 
         this._botAgent = this.getBotAgent(options.botAgent);
 
@@ -537,10 +579,26 @@ export class DirectLine implements IBotConnection {
             5
         );
 
+        if (options.handleHistoryApi !== undefined)
+            this.handleHistoryApi = options.handleHistoryApi;
+
+        if (options.historyId !== undefined)
+            this.historyId = options.historyId;
+
+        if (options.historyLoaded !== undefined)
+            this.historyLoaded = options.historyLoaded;
+
         this.activity$ = (this.webSocket
             ? this.webSocketActivity$()
             : this.pollingGetActivity$()
         ).share();
+    }
+
+    /**
+     * getConversationId
+     */
+     public getConversationId(): string {
+        return this.conversationId;
     }
 
     // Every time we're about to make a Direct Line REST call, we call this first to see check the current connection status.
@@ -559,7 +617,11 @@ export class DirectLine implements IBotConnection {
                     return this.startConversation().do(conversation => {
                         this.conversationId = conversation.conversationId;
                         this.token = this.secret || conversation.token;
-                        this.streamUrl = conversation.streamUrl;
+
+                        if ((conversation.streamUrl) && (this.handleHistoryApi)) {
+                            this.streamUrl = conversation.streamUrl.replace("watermark=-&", "");
+                        }
+
                         this.referenceGrammarId = conversation.referenceGrammarId;
                         if (!this.secret)
                             this.refreshTokenLoop();
@@ -658,13 +720,13 @@ export class DirectLine implements IBotConnection {
                 ? Observable.throw(error, this.services.scheduler)
                 : Observable.of(error, this.services.scheduler)
             })
-            .delay(this.timeout, this.services.scheduler)
+            .delay(this.retryDelay, this.services.scheduler)
             .take(this.retries)
         )
     }
 
     private refreshTokenLoop() {
-        this.tokenRefreshSubscription = Observable.interval(intervalRefreshToken, this.services.scheduler)
+        this.tokenRefreshSubscription = Observable.interval(this.intervalRefreshToken, this.services.scheduler)
         .flatMap(_ => this.refreshToken())
         .subscribe(token => {
             konsole.log("refreshing token", token, "at", new Date());
@@ -697,7 +759,7 @@ export class DirectLine implements IBotConnection {
 
                     return Observable.of(error, this.services.scheduler);
                 })
-                .delay(this.timeout, this.services.scheduler)
+                .delay(this.retryDelay, this.services.scheduler)
                 .take(this.retries)
             )
         )
@@ -705,7 +767,10 @@ export class DirectLine implements IBotConnection {
 
     public reconnect(conversation: Conversation) {
         this.token = conversation.token;
-        this.streamUrl = conversation.streamUrl;
+        this.conversationId = conversation.conversationId;
+        if ((conversation.streamUrl) && (this.handleHistoryApi)) {
+            this.streamUrl = conversation.streamUrl.replace("watermark=-&", "");
+        }
         if (this.connectionStatus$.getValue() === ConnectionStatus.ExpiredToken)
             this.connectionStatus$.next(ConnectionStatus.Online);
     }
@@ -979,6 +1044,18 @@ export class DirectLine implements IBotConnection {
 
             ws.onmessage = message => message.data && subscriber.next(JSON.parse(message.data));
 
+            if ((this.isFirstTime) && (this.handleHistoryApi)) {
+                this.isFirstTime = false;
+
+                var getUrl = window.location;
+                var baseUrl = getUrl.protocol + "//" + getUrl.host + "/";
+
+                var httpHistory = new XMLHttpRequest();
+                var urlHistory = baseUrl + "api/directline/history";
+
+                var that = this;
+            }
+
             // This is the 'unsubscribe' method, which is called when this observable is disposed.
             // When the WebSocket closes itself, we throw an error, and this function is eventually called.
             // When the observable is closed first (e.g. when tearing down a WebChat instance) then
@@ -1004,7 +1081,10 @@ export class DirectLine implements IBotConnection {
             .do(result => {
                 if (!this.secret)
                     this.token = result.response.token;
-                this.streamUrl = result.response.streamUrl;
+
+                if ((result.response.streamUrl) && (this.handleHistoryApi)) {
+                        this.streamUrl = result.response.streamUrl.replace("watermark=-&", "");
+                }
             })
             .map(_ => null)
             .retryWhen(error$ => error$
@@ -1019,7 +1099,7 @@ export class DirectLine implements IBotConnection {
 
                     return Observable.of(error, this.services.scheduler);
                 })
-                .delay(this.timeout, this.services.scheduler)
+                .delay(this.retryDelay, this.services.scheduler)
                 .take(this.retries)
             )
         )
