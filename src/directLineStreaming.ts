@@ -93,7 +93,7 @@ class StreamHandler implements BFSE.RequestHandler {
 export class DirectLineStreaming implements IBotConnection {
   public connectionStatus$ = new BehaviorSubject(ConnectionStatus.Uninitialized);
   public activity$: Observable<Activity>;
-
+  public historyLoadedFlag: boolean = false;
   private activitySubscriber: Subscriber<Activity>;
   private theStreamHandler: StreamHandler;
 
@@ -125,6 +125,7 @@ export class DirectLineStreaming implements IBotConnection {
       this.theStreamHandler = new StreamHandler(subscriber, this.connectionStatus$, () => this.queueActivities);
       this.connectWithRetryAsync();
     }).share();
+
   }
 
   public reconnect({ conversationId, token } : Conversation) {
