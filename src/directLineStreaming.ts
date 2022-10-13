@@ -93,6 +93,7 @@ class StreamHandler implements BFSE.RequestHandler {
 export class DirectLineStreaming implements IBotConnection {
   public connectionStatus$ = new BehaviorSubject(ConnectionStatus.Uninitialized);
   public activity$: Observable<Activity>;
+  public historyLoadedFlag: boolean;
 
   private activitySubscriber: Subscriber<Activity>;
   private theStreamHandler: StreamHandler;
